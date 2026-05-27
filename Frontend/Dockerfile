@@ -18,7 +18,8 @@ COPY Frontend/ Frontend/
 COPY Backend/ Backend/
  
  # Provide expected top-level path for event_generators used by the UI (CWD/event_generators)
- RUN ln -s Backend/event_generators event_generators
+ RUN ln -s Backend/event_generators event_generators \
+  && ln -s /app/event_generators /event_generators
 
 # Create non-root user
 RUN useradd -m -u 1001 appuser && chown -R appuser:appuser /app

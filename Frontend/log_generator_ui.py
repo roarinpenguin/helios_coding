@@ -1916,7 +1916,15 @@ def generate_logs():
         log_count = 999999999  # Effectively infinite
     
     if destination == 'syslog':
-        full_script_path = os.path.join(EVENT_GENERATORS_DIR, script_path)
+        # Backend API returns absolute paths like /event_generators/... which don't
+        # match the frontend container's layout (/app/event_generators/...).
+        # Normalise by stripping any leading prefix up to and including 'event_generators/'
+        # so we always resolve relative to EVENT_GENERATORS_DIR.
+        if os.path.isabs(script_path) and 'event_generators' in script_path:
+            rel = script_path.split('event_generators/', 1)[-1]
+            full_script_path = os.path.join(EVENT_GENERATORS_DIR, rel)
+        else:
+            full_script_path = os.path.join(EVENT_GENERATORS_DIR, script_path)
         if not os.path.exists(full_script_path):
             return jsonify({'error': 'Invalid script name or path'}), 400
 
@@ -1966,35 +1974,119 @@ def generate_logs():
                     return
 
                 yield "INFO: Starting log generation...\n"
+                # Re-import time locally: the HEC branch has its own `import time` later
+                # in this same function, which causes Python to treat `time` as a local
+                # variable throughout all of generate_and_stream. Re-importing here ensures
+                # it is assigned before first use in the syslog branch.
+                import time
 
-                command = ['python', full_script_path, str(log_count)]
-                process = subprocess.Popen(
-                    command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
+                delay = 1.0 / eps if eps > 0 else 0
+                sent_count = 0
+                _json_buf = []  # accumulates lines that belong to a multi-line JSON block
 
-                for line in iter(process.stdout.readline, ''):
-                    if line:
-                        log_line = line.strip()
+                def _flush_json_buf(buf):
+                    """Collapse a buffered multi-line JSON block into one compact line."""
+                    try:
+                        return json.dumps(json.loads('\n'.join(buf)))
+                    except Exception:
+                        return None
+
+                while sent_count < log_count:
+                    # Honour client disconnects (e.g. user pressed Stop)
+                    if request.environ.get('werkzeug.socket'):
                         try:
-                            if syslog_protocol_local == 'UDP':
-                                sock.sendto(bytes(log_line + '\n', 'utf-8'), (syslog_ip_local, syslog_port_local))
-                            else:
-                                sock.sendall(bytes(log_line + '\n', 'utf-8'))
-                        except Exception as e:
-                            yield f"ERROR: Failed to send log to syslog server. Details: {e}\n"
+                            request.environ.get('werkzeug.socket').getpeername()
+                        except Exception:
+                            yield "INFO: Stopped by client disconnect\n"
+                            break
+
+                    process = subprocess.Popen(
+                        ['python', full_script_path],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True
+                    )
+
+                    batch_sent = 0
+                    for raw_line in iter(process.stdout.readline, ''):
+                        if sent_count >= log_count:
                             process.terminate()
                             break
 
-                        yield f"LOG: {log_line}\n"
+                        stripped = raw_line.strip()
 
-                errors = process.stderr.read()
-                if errors:
-                    yield f"ERROR: Script execution produced errors:\n{errors}\n"
+                        # --- Line classification ---
+                        if not stripped:
+                            # Blank line: flush any in-progress JSON buffer
+                            if _json_buf:
+                                flushed = _flush_json_buf(_json_buf)
+                                _json_buf.clear()
+                                if flushed:
+                                    stripped = flushed
+                                else:
+                                    continue
+                            else:
+                                continue
+                        elif stripped[0] in ('{', '[') or _json_buf:
+                            # Part of a JSON block — buffer until the object parses cleanly
+                            _json_buf.append(stripped)
+                            try:
+                                parsed = json.loads('\n'.join(_json_buf))
+                                stripped = json.dumps(parsed)
+                                _json_buf.clear()
+                            except json.JSONDecodeError:
+                                continue  # Still accumulating more lines
+                        elif stripped.endswith(':') or all(c in '=-_ \t' for c in stripped):
+                            # Demo header / separator line ("Sample X events:", "====", etc.)
+                            continue
+                        # else: plain-text log line (key=value, CSV, …) — use as-is
 
-                process.wait()
+                        if not stripped:
+                            continue
+
+                        try:
+                            if syslog_protocol_local == 'UDP':
+                                sock.sendto(bytes(stripped + '\n', 'utf-8'), (syslog_ip_local, syslog_port_local))
+                            else:
+                                sock.sendall(bytes(stripped + '\n', 'utf-8'))
+                        except Exception as e:
+                            yield f"ERROR: Failed to send log to syslog server. Details: {e}\n"
+                            process.terminate()
+                            process.wait()
+                            return
+
+                        yield f"LOG: {stripped}\n"
+                        sent_count += 1
+                        batch_sent += 1
+                        if delay > 0 and sent_count < log_count:
+                            time.sleep(delay)
+
+                    # Flush any JSON still buffered at end of script run
+                    if _json_buf and sent_count < log_count:
+                        flushed = _flush_json_buf(_json_buf)
+                        _json_buf.clear()
+                        if flushed:
+                            try:
+                                if syslog_protocol_local == 'UDP':
+                                    sock.sendto(bytes(flushed + '\n', 'utf-8'), (syslog_ip_local, syslog_port_local))
+                                else:
+                                    sock.sendall(bytes(flushed + '\n', 'utf-8'))
+                                yield f"LOG: {flushed}\n"
+                                sent_count += 1
+                                batch_sent += 1
+                            except Exception as e:
+                                yield f"ERROR: Failed to send log to syslog server. Details: {e}\n"
+
+                    errors = process.stderr.read()
+                    process.wait()
+                    if errors and sent_count == 0:
+                        yield f"ERROR: Script execution produced errors:\n{errors}\n"
+                        break
+                    if batch_sent == 0:
+                        yield "ERROR: Generator script produced no output.\n"
+                        break
+
+                yield f"INFO: Sent {sent_count} log(s) to syslog.\n"
 
             elif destination == 'hec':
                 # Validate inputs
